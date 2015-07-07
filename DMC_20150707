@@ -1,0 +1,552 @@
+// ------------------------------------------------------------------------------
+//   Author:
+//   Jiaqi.Dai
+//   Jun. 2015
+//   Built with CCS Version 5.5.0
+// ------------------------------------------------------------------------------
+#include "DSP28x_Project.h"     // Device Headerfile and Examples Include File
+
+#include "IQmathLib.h"
+#include "dlog4ch.h"            // Include header for the DLOG_4CH object
+#include "pid_grando.h"
+#include "rampgen.h"        	// Include header for the RAMPGEN object
+#include "rmp_cntl.h"       	// Include header for the RMPCNTL object
+#include "f2803xileg_vdc.h" 	// Include header for the ILEG2DCBUSMEAS object
+#include "f2803xpwm.h"        	// Include header for the PWMGEN object
+#include "f2803xhall_gpio.h"    // Include header for the HALL object
+#include "svgen.h"       		// Include header for the SVGENDQ object
+#include "ipark.h"       		// Include header for the IPARK object
+#include "park.h"       		// Include header for the PARK object
+#include "clarke.h"         	// Include header for the CLARKE object
+#include "volt_calc.h"      	// Include header for the PHASEVOLTAGE object
+#include "speed_pr.h"			// Include header for the Cal_MotorSpeed object
+
+#define FLASH
+//#ifdef FLASH
+//#pragma CODE_SECTION(MainISR,"ramfuncs");
+//#endif
+
+#define SYSTEM_FREQUENCY  60     // Define the system frequency (MHz)
+#define ISR_FREQUENCY     10     // Define the ISR frequency (kHz)
+#define POLES         	   4	 // Number of poles
+#define BASE_FREQ      	 100     // Base electrical frequency (Hz)
+// BaseRpm=120*BASE_FREQ/Poles	-->3000Rpm=120*100/4
+float32 T = 0.001/ISR_FREQUENCY; // Samping period (sec), see parameter.h --> 100ns
+
+#define MEA_DEFAULTS { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, }
+_iq PHASE_CURRENT_LIMIT =   _IQ(0.5);      // 125A --> 1.00   10A --> 0.08
+_iq APU_CURRENT_LIMIT   =   _IQ(5);
+_iq BUS_VOLTAGE_LIMIT   =   _IQ(20);
+int16 CPU_TEMP_LIMIT    =	50;
+int32 SPEED_LIMIT 		=	500;
+
+enum error_status{
+	OVER_VOLTAGE,            // Regenerative brake over voltage
+	UNDER_VOLTAGE,
+	OVER_PHASECURRENT,
+	OVER_APUCURRENT,
+	OVER_SPEED,
+	UNDER_SPEED,
+	ERROR_HALL,
+	OVER_HEAT
+};
+char error_flag = 0, error_flag1 = 0;
+
+typedef struct {int16  CPU_Temp;		// Output: CPU Temperature Unit: DegreesC
+				int16  Ua;  			// Output: Phase A Voltage
+				int16  Ub;				// Output: Phase B Voltage
+				int16  Uc;				// Output: Phase C Voltage
+				int16  Em;				// Cal:    Neutral Point Voltage
+				int16  Ea;				// Cal:    EBMF A
+				int16  Eb;				// Cal:    EBMF B
+				int16  Ec;				// Cal:    EBMF C
+				_iq15  Load_Current;	// Output: Load    Current	-->  3.75mV/A
+				  _iq  APU_Current;		// Output: APU     Current  -->  15.0mV/A
+				  _iq  Bus_Voltage;		// Output: DC Bus  Voltage	-->	 29.57142
+				  _iq  Ia;  			// Output: Phase A Current	-->  13.2mV/A
+				  _iq  Ib;				// Output: Phase B Current  -->  13.2mV/A
+		 	    } Measurements;
+
+Measurements mea1 = MEA_DEFAULTS;
+
+// Default ADC initialization
+int ChSel[16]   = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+int	TrigSel[16] = {5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5};
+int ACQPS[16]   = {6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6};
+
+_iq VdTesting = _IQ(0.0);			// Vd reference (pu)
+_iq VqTesting = _IQ(0.0);			// Vq reference (pu)
+_iq IdRef = _IQ(0.0);				// Id reference (pu)
+_iq IqRef = _IQ(0.0);				// Iq reference (pu)
+_iq SpeedRef = _IQ(0.0);			// Speed reference (pu)
+_iq15 cal_offset_ia   = _IQ15(0.49927);
+_iq15 cal_offset_ib   = _IQ15(0.50293);
+_iq15 cal_offset_apu  = _IQ15(0.45044);	//1845
+_iq15 cal_offset_load = _IQ15(0.45654);	//1870
+_iq gain = _IQ(0.08);
+_iq Theta;
+_iq Potentiometer;
+
+// Calculate Speed
+SPEED_MEAS_CAP speed = SPEED_MEAS_CAP_DEFAULTS;
+Uint32 VirtualTimer = 0;
+Uint16 PreviousState = 1;
+
+// Instance a PWM driver instance
+PWMGEN pwm1 = PWMGEN_DEFAULTS;
+
+// Instance a ramp generator to simulate an Angle
+RAMPGEN rg1 = RAMPGEN_DEFAULTS;
+
+// Instance a ramp controller to smoothly ramp the frequency
+RMPCNTL rc1 = RMPCNTL_DEFAULTS;
+
+// Instance a Space Vector PWM modulator. This modulator generates a, b and c
+// phases based on the d and q stationery reference frame inputs
+SVGEN svgen1 = SVGEN_DEFAULTS;
+
+// Instance a few transform objects
+CLARKE clarke1 = CLARKE_DEFAULTS;
+IPARK  ipark1  = IPARK_DEFAULTS;
+PARK   park1   = PARK_DEFAULTS;
+
+// Instance HallMap calculation
+HALL3 hall = HALL3_DEFAULTS;
+
+// Instance a phase voltage calculation
+PHASEVOLTAGE volt1 = PHASEVOLTAGE_DEFAULTS;
+
+// Instance PID regulators to regulate the d and q  axis currents, and speed
+PID_CONTROLLER pid1_id = {PID_TERM_DEFAULTS,PID_PARAM_DEFAULTS,PID_DATA_DEFAULTS};
+PID_CONTROLLER pid1_iq = {PID_TERM_DEFAULTS,PID_PARAM_DEFAULTS,PID_DATA_DEFAULTS};
+
+// Create an instance of DATALOG Module
+DLOG_4CH dlog = DLOG_4CH_DEFAULTS;
+
+int16 DlogCh1 = 0;
+int16 DlogCh2 = 0;
+int16 DlogCh3 = 0;
+int16 DlogCh4 = 0;
+
+Uint16 lsw = 0;
+//int error_flag=0,error_flag1=0,error_flag2=0,error_flag3=0;
+
+// Prototype statements for functions found within this file.
+interrupt void MainISR(void);
+// TODO: main
+void main(void)
+{
+// Step 1. Initialize System Control:
+// PLL, WatchDog, enable Peripheral Clocks
+// This example function is found in the DSP2802x_SysCtrl.c file.
+	InitSysCtrl();
+
+#ifdef FLASH
+	MemCopy(&RamfuncsLoadStart, &RamfuncsLoadEnd, &RamfuncsRunStart);
+	InitFlash();
+#endif //(FLASH)
+
+// Step 2. Initialize GPIO:
+// This example function is found in the DSP2802x_Gpio.c file and
+// illustrates how to set the GPIO to it's default state.
+	InitEPwm1Gpio();
+	InitEPwm2Gpio();
+	InitEPwm3Gpio();
+	InitGpio();  		// Init EN_GATE
+	InitTzGpio();		// Init TZ1
+
+// Step 3. Clear all interrupts and initialize PIE vector table:
+// Disable CPU interrupts
+	DINT;
+
+// Initialize the PIE control registers to their default state.
+// The default state is all PIE interrupts disabled and flags
+// are cleared.
+// This function is found in the DSP2802x_PieCtrl.c file.
+	InitPieCtrl();
+
+// Disable CPU interrupts and clear all CPU interrupt flags:
+	IER = 0x0000;
+	IFR = 0x0000;
+
+// Initialize the PIE vector table with pointers to the shell Interrupt
+// Service Routines (ISR).
+// This will populate the entire table, even if the interrupt
+// is not used in this example.  This is useful for debug purposes.
+// The shell ISR routines are found in DSP2802x_DefaultIsr.c.
+// This function is found in DSP2802x_PieVect.c.
+	InitPieVectTable();
+
+// Step 4. Initialize all the Device Peripherals:
+// This function is found in DSP2802x_InitPeripherals.c
+// InitPeripherals(); // Not required for this example
+	HALL3_INIT_MACRO (hall);						// Call init macro for Hall3
+
+// Initialize PWM module
+	pwm1.PeriodMax  = SYSTEM_FREQUENCY*1000000*T/2;  // Prescaler X1 (T1), ISR period = T x 1
+	pwm1.HalfPerMax = pwm1.PeriodMax/2;
+	pwm1.Deadband   = 1.0*SYSTEM_FREQUENCY;     	    // 120 counts -> 2.0 usec for TBCLK = SYSCLK/1
+	PWM_INIT_MACRO(1,2,3,pwm1)
+
+// Initialize TZ1
+	EALLOW;
+	EPwm1Regs.TZSEL.bit.OSHT1 = 1;
+	EPwm2Regs.TZSEL.bit.OSHT1 = 1;
+	EPwm3Regs.TZSEL.bit.OSHT1 = 1;
+
+	EPwm1Regs.TZCTL.bit.TZA = TZ_FORCE_LO;
+	EPwm1Regs.TZCTL.bit.TZB = TZ_FORCE_LO;
+	EPwm2Regs.TZCTL.bit.TZA = TZ_FORCE_LO;
+	EPwm2Regs.TZCTL.bit.TZB = TZ_FORCE_LO;
+	EPwm3Regs.TZCTL.bit.TZA = TZ_FORCE_LO;
+	EPwm3Regs.TZCTL.bit.TZB = TZ_FORCE_LO;
+//
+//	EPwm1Regs.TZFRC.bit.OST = 1;	// DisablePWM1
+//	EPwm2Regs.TZFRC.bit.OST = 1;	// DisablePWM2
+//	EPwm3Regs.TZFRC.bit.OST = 1;	// DisablePWM3
+	EPwm1Regs.TZCLR.bit.OST = 1;	// EnablePWM1
+	EPwm2Regs.TZCLR.bit.OST = 1;	// EnablePWM2
+	EPwm3Regs.TZCLR.bit.OST = 1;	// EnablePWM3
+	EDIS;
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the PWM_DRV module and call the PWM signal generation macro
+// ------------------------------------------------------------------------------
+	pwm1.MfuncC1 = _IQ(0);
+	pwm1.MfuncC2 = _IQ(0);
+	pwm1.MfuncC3 = _IQ(0);
+	PWM_MACRO(1,2,3,pwm1)							// Calculate the new PWM compare values
+
+// Initialize ADC for DMC Kit Rev 1.1
+   	ChSel[0] = 1;		// Dummy meas. avoid 1st sample issue Rev0 Picollo*/
+   	ChSel[1] = 6;		// ChSelect: ADC A6-> TSI = Potentiometer
+   	ChSel[2] = 8;	    // ChSelect: ADC B0-> Phase A Voltage
+   	ChSel[3] = 9;	    // ChSelect: ADC B1-> DC Bus  Voltage
+   	ChSel[4] = 10;	    // ChSelect: ADC B2-> Phase A Current
+   	ChSel[5] = 11;	    // ChSelect: ADC B3-> Phase B Current
+   	ChSel[6] = 12;   	// ChSelect: ADC B4-> Phase B Voltage
+   	ChSel[7] = 13;		// ChSelect: ADC B5-> Phase C Voltage
+   	ChSel[8] = 14;		// ChSelect: ADC B6-> APU     Current
+   	ChSel[9] = 15;		// ChSelect: ADC B7-> Load    Current
+   	ChSel[10]= 5;		// ChSelect: ADC A5-> Internal Temperature Sensor
+   	ADC_MACRO_INIT(ChSel,TrigSel,ACQPS)
+
+// Initialize DATALOG module
+    dlog.iptr1 = &DlogCh1;
+    dlog.iptr2 = &DlogCh2;
+    dlog.iptr3 = &DlogCh3;
+    dlog.iptr4 = &DlogCh4;
+    dlog.trig_value = _IQ15(0.5);
+    dlog.size = 100;
+    dlog.prescalar = 100;
+    dlog.init(&dlog);
+
+// Initialize the SPEED_PR module
+ 	speed.InputSelect = 0;
+ 	speed.BaseRpm 	  = 120*(BASE_FREQ/POLES);
+ 	speed.SpeedScaler = (Uint32)(ISR_FREQUENCY/(1*BASE_FREQ*0.001));
+
+// Initialize the RAMPGEN module
+	rg1.StepAngleMax = _IQ(BASE_FREQ*T);
+	rg1.Freq = _IQ(0.0);                 //Prescaler
+
+// Initialize the RMPCNTL module
+	rc1.TargetValue = 0;
+	rc1.SetpointValue = 0;
+	rc1.RampLowLimit = _IQ(0.0);
+	rc1.RampHighLimit = _IQ(0.5);
+	rc1.RampDelayMax = 50;
+
+// Initialize the PID_GRANDO_CONTROLLER module for Id
+	pid1_id.param.Kp = _IQ(0.6);
+	pid1_id.param.Kr = _IQ(0.1);
+	pid1_id.param.Ki = _IQ(0.08);
+	pid1_id.param.Kd = _IQ(0.0);
+	pid1_id.param.Km = _IQ(1.0);
+	pid1_id.param.Umax = _IQ(0.50);
+	pid1_id.param.Umin = _IQ(-0.50);
+
+// Initialize the PID_GRANDO_CONTROLLER module for Iq
+	pid1_iq.param.Kp = _IQ(0.6);
+	pid1_iq.param.Kr = _IQ(0.1);
+	pid1_iq.param.Ki = _IQ(0.08);
+	pid1_iq.param.Kd = _IQ(0.0);
+	pid1_iq.param.Km = _IQ(1.0);
+	pid1_iq.param.Umax = _IQ(0.5);
+	pid1_iq.param.Umin = _IQ(-0.5);
+
+// Enable ADC interrupt
+   	EALLOW;
+    AdcRegs.INTSEL1N2.bit.INT1CONT  = 0;  //Disable ADCINT1 Continuous mode
+	AdcRegs.INTSEL1N2.bit.INT1E = 1;        //Enabled ADCINT1
+	EDIS;
+
+// Step 5. User specific code, enable interrupts
+// Enable ADCINT1 in PIE
+// Reassign ISRs.
+
+	EALLOW;	// This is needed to write to EALLOW protected registers
+	PieVectTable.ADCINT1 = &MainISR;
+	EDIS;   // This is needed to disable write to EALLOW protected registers
+
+// Enable PIE group 1 interrupt 1 for ADC1_INT
+	PieCtrlRegs.PIEIER1.bit.INTx1 = 1;
+
+// Enable CPU INT1 for ADC1_INT:
+	IER |= M_INT1;
+
+// Enable global Interrupts and higher priority real-time debug events:
+	EINT;   // Enable Global interrupt INTM
+	ERTM;	// Enable Global realtime interrupt DBGM
+
+    GpioDataRegs.GPASET.bit.GPIO16 = 1;   //EN_GATE enabled
+
+// Step 6. IDLE loop. Just sit and loop forever (optional):
+	for(;;)
+	{
+//		if (Potentiometer < _IQ(-0.001))
+//		{
+//			EALLOW;
+//			EPwm1Regs.TZFRC.bit.OST = 1;
+//			EPwm2Regs.TZFRC.bit.OST = 1;
+//			EPwm3Regs.TZFRC.bit.OST = 1;
+//			EDIS;
+//			error_flag=0;
+//			error_flag1=0;
+//		}
+//		if (Potentiometer >= _IQ(-0.001))
+//		{
+//			EALLOW;
+//			EPwm1Regs.TZCLR.bit.OST = 1;
+//			EPwm2Regs.TZCLR.bit.OST = 1;
+//			EPwm3Regs.TZCLR.bit.OST = 1;
+//			EDIS;
+//		}
+
+
+		asm("          NOP");
+	}
+
+}
+
+// TODO: MainISR
+interrupt void  MainISR(void)
+{
+
+//  lsw=0: lock the rotor of the motor
+//  lsw=1: close the current loop
+	Potentiometer = _IQmpy((_IQ15toIQ((AdcResult.ADCRESULT1<<3) - _IQ15(0.5201367))<<1), gain);	//Max_Potentiometer equal to 0.02
+	mea1.CPU_Temp = GetTemperatureC ( AdcResult.ADCRESULT10 );
+// ------------------------------------------------------------------------------
+//	Bus Voltage , Load Current , APU Current , Phase Voltage and Phase Current
+// ------------------------------------------------------------------------------
+	mea1.Load_Current= _IQ15mpy((((AdcResult.ADCRESULT9<<3) - cal_offset_load)<<1), _IQ15(480));	  //*0.2148
+	mea1.APU_Current = _IQmpy((_IQ15toIQ((AdcResult.ADCRESULT8<<3) - cal_offset_apu)<<1), _IQ(120));  //*0.05371
+	mea1.Bus_Voltage = _IQmpy(_IQ15toIQ(AdcResult.ADCRESULT3<<3), _IQ(97.58572));	                  //*0.023825
+	mea1.Ia = (_IQ15toIQ((AdcResult.ADCRESULT4<<3) - cal_offset_ia)<<1);		// Actual value = mea1.Ia * 125
+	mea1.Ib = (_IQ15toIQ((AdcResult.ADCRESULT5<<3) - cal_offset_ib)<<1);		// Actual value = mea1.Ib * 125
+	mea1.Ua = AdcResult.ADCRESULT2;
+	mea1.Ub = AdcResult.ADCRESULT6;
+	mea1.Uc = AdcResult.ADCRESULT7;
+	mea1.Em = (mea1.Ua+mea1.Ub+mea1.Uc)/3;
+	mea1.Ea = mea1.Ua-mea1.Em;
+	mea1.Eb = mea1.Ub-mea1.Em;
+	mea1.Ec = mea1.Uc-mea1.Em;
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the RMP module and call the ramp control macro
+// ------------------------------------------------------------------------------
+	rc1.TargetValue = SpeedRef;
+	RC_MACRO(rc1)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the RAMP GEN module and call the ramp generator macro
+// ------------------------------------------------------------------------------
+//	rg1.Freq = rc1.SetpointValue;
+	rg1.Freq = _IQsat(Potentiometer,_IQ(1.0),_IQ(0.0));		//Saturate the Freq of ramp
+	RG_MACRO(rg1)
+
+//  Read Hall Status
+	HALL3_READ_MACRO (hall);						// Call the hall3 read macro
+
+// ------------------------------------------------------------------------------
+//  Create a ladder Theta according to HallGpio	(Actual)
+// ------------------------------------------------------------------------------
+	if	   (hall.HallGpioAccepted==6)	//6(2)
+		Theta=_IQ(0.08333);//_IQ(0.00000);//_IQ(0.16667);
+	else if(hall.HallGpioAccepted==4)	//4(6)
+		Theta=_IQ(0.25000);//_IQ(0.16667);//_IQ(0.33333);
+	else if(hall.HallGpioAccepted==5)	//5(4)
+		Theta=_IQ(0.41667);//_IQ(0.33333);//_IQ(0.50000);
+	else if(hall.HallGpioAccepted==1)	//1(5)
+		Theta=_IQ(0.58333);//_IQ(0.50000);//_IQ(0.66667);
+	else if(hall.HallGpioAccepted==3)	//3(1)
+		Theta=_IQ(0.75000);//_IQ(0.66667);//_IQ(0.83333);
+	else if(hall.HallGpioAccepted==2)	//2(3)
+		Theta=_IQ(0.91667);//_IQ(0.83333);//_IQ(0.99999);
+
+// ------------------------------------------------------------------------------
+//  Create a ladder Theta according to the rg1.Out	(Fake)
+// ------------------------------------------------------------------------------
+//	if	   (rg1.Out>0 	 	 	 && rg1.Out<=_IQ(0.16667))
+//		Theta=_IQ(0.08333);
+//	else if(rg1.Out>_IQ(0.16667) && rg1.Out<=_IQ(0.33333))
+//		Theta=_IQ(0.25000);
+//	else if(rg1.Out>_IQ(0.33333) && rg1.Out<=_IQ(0.50000))
+//		Theta=_IQ(0.41667);
+//	else if(rg1.Out>_IQ(0.50000) && rg1.Out<=_IQ(0.66667))
+//		Theta=_IQ(0.58333);
+//	else if(rg1.Out>_IQ(0.66667) && rg1.Out<=_IQ(0.83333))
+//		Theta=_IQ(0.75000);
+//	else if(rg1.Out>_IQ(0.83333) && rg1.Out<=_IQ(1.00000))
+//		Theta=_IQ(0.91667);
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the SPEED_PR module and call the speed calculation macro.
+// ------------------------------------------------------------------------------
+//	While counting up we want positive speed
+	if((hall.HallGpioAccepted==5)&&(PreviousState==4))
+	{
+		speed.TimeStamp = VirtualTimer;
+		SPEED_PR_MACRO(speed)
+	}
+//	While counting down we want negative speed
+	else if((hall.HallGpioAccepted==5)&&(PreviousState==1))
+	{
+		speed.TimeStamp = VirtualTimer;
+		SPEED_PR_MACRO(speed)
+//		speed.Speed = _IQmpy(speed.Speed,_IQ(-1.0));
+		speed.SpeedRpm = _IQmpy(speed.SpeedRpm,_IQ(-1.0));
+	}
+	PreviousState = hall.HallGpioAccepted;
+
+// TODO: Protection
+	if(mea1.Bus_Voltage >= BUS_VOLTAGE_LIMIT)
+	{
+		error_flag |= (1 << OVER_VOLTAGE);
+	}
+	if((mea1.Ia >= PHASE_CURRENT_LIMIT)||(mea1.Ib >= PHASE_CURRENT_LIMIT)||(mea1.Ia <= -PHASE_CURRENT_LIMIT)||(mea1.Ib <= -PHASE_CURRENT_LIMIT))
+	{
+		error_flag |= (1 << OVER_PHASECURRENT);
+	}
+	if((mea1.APU_Current >= APU_CURRENT_LIMIT))
+	{
+		error_flag |= (1 << OVER_APUCURRENT);
+	}
+	if((hall.HallGpioAccepted == 0)||(hall.HallGpioAccepted == 7))
+	{
+		error_flag |= (1 << ERROR_HALL);
+	}
+	if(mea1.CPU_Temp >= CPU_TEMP_LIMIT)
+	{
+		error_flag |= (1 << OVER_HEAT);
+	}
+	if(speed.SpeedRpm >= SPEED_LIMIT)
+	{
+		error_flag |= (1 << OVER_SPEED);
+	}
+
+	if((error_flag | 0x00) != 0x00 )
+	{
+		EALLOW;
+		EPwm1Regs.TZFRC.bit.OST = 1;
+		EPwm2Regs.TZFRC.bit.OST = 1;
+		EPwm3Regs.TZFRC.bit.OST = 1;
+		EDIS;
+	}
+
+// TODO: SVPWM
+// ------------------------------------------------------------------------------
+//  Measure phase currents, subtract the offset and normalize from (-0.5,+0.5) to (-1,+1).
+//	Connect inputs of the CLARKE module and call the clarke transformation macro
+// ------------------------------------------------------------------------------
+    clarke1.As = mea1.Ia;
+    clarke1.Bs = mea1.Ib;
+    CLARKE_MACRO(clarke1)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the PARK module and call the park trans. macro
+// ------------------------------------------------------------------------------
+	park1.Alpha 	= clarke1.Alpha;
+	park1.Beta 		= clarke1.Beta;
+	park1.Angle 	= Theta;		//rg1.Out;
+	park1.Sine 		= _IQsinPU(park1.Angle);
+	park1.Cosine	= _IQcosPU(park1.Angle);
+	PARK_MACRO(park1)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the PID_GRANDO_CONTROLLER module and call the PID IQ controller macro
+// ------------------------------------------------------------------------------
+	IqRef	= _IQsat(Potentiometer,_IQ(1.0),_IQ(0.0));
+    pid1_iq.term.Ref = IqRef;
+	pid1_iq.term.Fbk = park1.Qs;
+	PID_MACRO(pid1_iq)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the PID_GRANDO_CONTROLLER module and call the PID ID controller macro
+// ------------------------------------------------------------------------------
+    pid1_id.term.Ref = IdRef;
+	pid1_id.term.Fbk = park1.Ds;
+	PID_MACRO(pid1_id)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the INV_PARK module and call the inverse park trans. macro
+//	There are two option for trigonometric functions:
+//  IQsin/cos PU functions interpolate the data in the lookup table yielding higher resolution.
+// ------------------------------------------------------------------------------
+
+//	VqTesting= _IQsat(Potentiometer,_IQ(1.0),_IQ(0.0));
+	if(lsw==0)
+	{
+		ipark1.Ds = 0;
+		ipark1.Qs = 0;
+	}else if(lsw==1)
+	{
+		ipark1.Ds = pid1_id.term.Out;	//VdTesting;
+		ipark1.Qs = pid1_iq.term.Out;	//VqTesting;
+	}
+
+//	ipark1.Angle=rg1.Out;
+    ipark1.Sine=_IQsinPU(Theta);	//rg1.Out
+    ipark1.Cosine=_IQcosPU(Theta);	//rg1.Out
+	IPARK_MACRO(ipark1)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the SVGEN_DQ module and call the space-vector gen. macro
+// ------------------------------------------------------------------------------
+	svgen1.Ualpha = ipark1.Alpha;
+	svgen1.Ubeta = ipark1.Beta;
+	SVGENDQ_MACRO(svgen1)
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the PWM_DRV module and call the PWM signal generation macro
+// ------------------------------------------------------------------------------
+	pwm1.MfuncC1 = svgen1.Ta;
+	pwm1.MfuncC2 = svgen1.Tb;
+	pwm1.MfuncC3 = svgen1.Tc;
+	PWM_MACRO(1,2,3,pwm1)							// Calculate the new PWM compare values
+
+// ------------------------------------------------------------------------------
+//  Increase virtual timer and force 15 bit wrap around
+// ------------------------------------------------------------------------------
+	VirtualTimer++;
+	VirtualTimer &= 0x007FFFFF;
+
+// ------------------------------------------------------------------------------
+//  Connect inputs of the DATALOG module
+// ------------------------------------------------------------------------------
+	DlogCh1 = _IQtoQ15(Theta);	//rg1.Out
+    DlogCh2 = _IQtoQ15(park1.Qs);	//hall.HallGpio
+    DlogCh3 = _IQtoQ15(park1.Ds);//_IQtoQ15(park1.Ds);
+    DlogCh4 = _IQtoQ15(mea1.Ia);
+
+	dlog.update(&dlog);
+
+	AdcRegs.ADCINTFLGCLR.bit.ADCINT1 = 1;	  //Clear ADCINT1 flag reinitialize for next SOC
+	PieCtrlRegs.PIEACK.all = PIEACK_GROUP1;   // Acknowledge interrupt to PIE
+	return;
+}
+
+//===========================================================================
+// No more.
+//===========================================================================
